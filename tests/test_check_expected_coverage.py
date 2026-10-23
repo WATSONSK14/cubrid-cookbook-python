@@ -151,6 +151,61 @@ class MissingGoldenTests(unittest.TestCase):
 
             self.assertEqual(result, [])
 
+    def test_folder_with_regular_file_named_expected_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            example = root / "examples"
+            example.mkdir()
+            (example / "expected").write_text("I am not folder.\n", encoding="utf-8")
+
+            (example / "demo.py").write_text(
+                "print('hello')\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(coverage, "REPO_ROOT", root):
+                result = coverage.find_missing([example], set())
+
+            self.assertEqual(result, [])
+
+    def test_script_in_subfolder_without_own_expected_directory_is_not_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            example = root / "examples"
+            expected = example / "expected"
+            expected.mkdir(parents=True)
+            sub = example / "sub"
+            sub.mkdir()
+            (sub / "demo.py").write_text(
+                "print('hello')\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(coverage, "REPO_ROOT", root):
+                result = coverage.find_missing([example], set())
+
+            self.assertEqual(result, [])
+
+    def test_golden_with_wrong_suffix_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            example = root / "examples"
+            expected = example / "expected"
+            expected.mkdir(parents=True)
+            (example / "demo.py").write_text(
+                "print('hello')\n",
+                encoding="utf-8",
+            )
+            (expected / "demo.txt").write_text(
+                "wrong suffix\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(coverage, "REPO_ROOT", root):
+                result = coverage.find_missing([example], set())
+
+            self.assertEqual(result, ["examples/demo.py"])
+
 
 class MainTests(unittest.TestCase):
     def test_missing_golden_returns_exit_code_one(self):
