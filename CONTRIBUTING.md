@@ -23,25 +23,14 @@ Every change to an example ships its implementation, tests, and affected docs
 **together**; code without affected doc updates is incomplete. Unaffected docs
 retain the existing docs-not-needed process.
 
-Maintainer/agent-authored PRs follow the tool-specific route in
-[AGENTS.md](AGENTS.md#development-workflow-cubrid-lab-org-standard):
-- **OpenCode:** Oracle design review before non-trivial implementation and
-  Oracle post-implementation review, with documented findings and validation.
-  Trivial OpenCode changes may skip those Oracle phases with a recorded reason.
-- **Standalone agents (Claude Code, Codex, ChatGPT, or other agent tools):**
-  after opening the PR, wait for a substantive submitted GitHub Copilot review
-  or a review by a maintainer (a code owner other than the PR's author),
-  recorded on the PR (maintainer decision, 2026-10-15). Other people's reviews
-  and other AI agents' reviews do not satisfy this route. A pending request,
-  green CI, self-review or automated approval wording alone does not complete
-  it.
-- **Human contributions:** normal project review, with no internal agent-tool
-  installation requirement. This is not a fallback for unnamed standalone agents.
-
-The applicable review evidence, updated head, dispositions and open threads
-must be recorded before merge. Live CUBRID, docs and CI rules remain unchanged.
-Maintainers coordinate internal reviews and integration, while contributors
-retain authorship and provide ordinary PR evidence.
+All contributions follow the same review and merge policy regardless of
+human or AI implementation (OpenCode, Codex, Claude Code, ChatGPT, Copilot,
+and other tools). Use required GitHub Actions CI as final test evidence,
+including `make check test` and applicable live CUBRID checks. Local
+validation is encouraged but not an extra merge requirement. AI reviewers
+(Oracle, Copilot and `agent-review`) are optional advisory resources.
+The responsible maintainer confirms review findings and final checks
+before deciding to merge. Preserve current security and release controls.
 
 The existing documentation/coverage rule, not the review-route requirement, is
 checked in CI by `scripts/check_docs_sync.py` (the **Docs sync gate** job).
@@ -64,16 +53,27 @@ small offline test toolchain in a virtual environment:
 
 ```bash
 python3 -m pip install -r quickstart/5min-fastapi/requirements.txt pytest httpx sqlalchemy ruff==0.16.4
-make check
+make check test
 ```
 
-`make check` runs Ruff, documentation and golden-coverage checks, output-normalizer
-tests, mocked quickstart and AI-agent tests, release dependency guards, and fake
-Make/Compose regression tests. `make test-offline` runs just the offline test
-suites. Each suite uses its own process to avoid conflicting recipe module names.
+`make check` is the non-test quality gate: `make lint` (`ruff check`),
+`make format-check` (`ruff format --check`), the documentation checks
+(`make check-docs`) and the golden-coverage check (`make check-coverage`); none of
+them changes a file. `make format` is the only target that rewrites source files
+(`ruff check --fix`, then `ruff format`). `make test` (alias `make test-offline`)
+runs every offline suite: output-normalizer tests (`make test-normalize`), mocked
+quickstart and AI-agent tests, release dependency guards, workflow guards and fake
+Make/Compose regression tests. The suite list lives in
+`scripts/run_offline_tests.py`, and each suite runs in its own process to avoid
+conflicting recipe module names.
 These checks require no database and do not prove live CUBRID compatibility;
-run the relevant example or `make verify` against CUBRID for that evidence.
-CI runs the same `make check` command on every pull request (see
+run the relevant example, a `make verify-*` lane or the full `make verify` against
+CUBRID for that evidence (see [Live verification](#live-verification)).
+`make clean` removes generated files, caches and test results (`.live-evidence/`,
+`__pycache__`, `.pytest_cache`, `.ruff_cache`, the staged docs pages and `site/`)
+and never touches Docker; `make down` stops the lab and keeps its data, and only
+`make docker-clean` deletes the lab's containers and volumes, database data included.
+CI runs the same `make check test` command on every pull request (see
 [CI tiers](#ci-tiers) for which live lanes run on top of it). The blocking
 documentation check has its own pinned tools; run it with
 `python3 -m pip install -r .github/requirements-docs-check.txt` and `make docs-check`
@@ -85,7 +85,7 @@ The repository is an example collection, so `pip install -e .` is not supported.
 [`agent-evals/`](agent-evals/README.md) holds opt-in benchmark tasks for coding
 agents that change recipes (#352): frozen historical fixes with their base SHA,
 allowed files, goldens, documentation and the live checks they lack, graded offline
-by `scripts/agent_eval.py`. `make agent-eval-check` (part of `make test-offline`)
+by `scripts/agent_eval.py`. `make agent-eval-check` (part of `make test`)
 re-grades the recorded fixtures; it runs no model and needs no database. No
 contributor needs an AI tool, and no agent score gates a pull request. If you change
 the grader or a task, keep every fixture's `expected.json` truthful and rerun
@@ -121,7 +121,7 @@ cubrid-mcp-server and this cookbook except for repository-specific data:
 - **GitHub Actions** — checked weekly; all action bumps arrive as one grouped
   PR. Workflows pin every action by full commit SHA with a `# vX.Y.Z` comment,
   and each action uses the same pin in every workflow;
-  `tests/test_dependabot_config.py` (part of `make check`) enforces both.
+  `tests/test_dependabot_config.py` (part of `make test`) enforces both.
 - **Recipe requirements (pip)** — checked monthly across every standalone
   recipe directory. Updates are grouped by dependency name, so one PR bumps a
   package (for example `flask`) in every recipe that uses it instead of one PR
@@ -140,6 +140,93 @@ When a new recipe adds a `requirements.txt` outside the configured
 `directories` globs, extend the globs in the same PR; the test above fails
 until you do.
 
+### Live verification
+
+`make test` needs no database. `make verify` is the full live verification: it
+runs `scripts/live_gate.py all`, which reruns every golden and every existing live
+pytest suite (it adds no test of its own; each suite runs in its own pytest
+process) against real CUBRID databases, fails closed, and records what ran (#416).
+
+| Lane (`make` target) | What runs | Database |
+|----------------------|-----------|----------|
+| goldens (`verify-goldens`) | every `expected/*.expected` golden, see [Golden Verification](#golden-verification) | the `make up` database |
+| `verify-quickstart` | `quickstart/5min-fastapi/tests/test_live.py`: `/health` and CRUD (#420) | the `make up` database (the app connects to port 33000 and `testdb` only); it keeps its own `cookbook_quickstart_items` table |
+| `verify-performance` | `tests/test_performance_benchmarks.py`: the five migration goldens and the three benchmarks (#423), see [Performance and migration lane](#performance-and-migration-lane) | the `make up` database (the scripts hard-code it) |
+| `verify-web` | `templates/flask/*/tests`, `templates/api-service-fastapi/recipes/*/tests`; `templates/api-service-fastapi/tests` (root template startup and `/health`) | `CUBRID_TEST_URL`; the root template test uses SQLite by design and is reported as startup-only, not live evidence or quickstart coverage |
+| `verify-django-celery` | `templates/django/tests`, `templates/async-worker/tests` | `CUBRID_TEST_URL`; Celery tasks run directly (`.run()` / eager `.apply()`), without Redis or a worker |
+| `verify-ai-agent` | `tests/test_ai_agent.py`: agent state, MCP tools and RAG, each script run twice (#422) | `CUBRID_TEST_URL` |
+| `verify-dashboard` | `templates/dashboard/tests` | `CUBRID_DASHBOARD_TEST_URL`: the suite drops and recreates its FK-linked tables |
+
+`make verify` runs the lanes in this order, one at a time, so suites with fixed
+table names never overlap; `make verify-templates` runs `verify-web`,
+`verify-django-celery` and `verify-dashboard`. Each lane can also run on its own.
+The goldens leave their fixed tables in the `make up` database, so
+`CUBRID_TEST_URL` and `CUBRID_DASHBOARD_TEST_URL` must name two further dedicated,
+empty databases, distinct from each other and from the `make up` database:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate   # Python 3.11 or later
+make deps        # every example's requirements.txt, in one pip call
+make up          # the examples' database on localhost:33000
+# Two disposable CUBRID containers for the dedicated databases (never your lab container)
+docker run -d --name cubrid-verify -p 127.0.0.1:33005:33000 -e CUBRID_DB=testdb cubrid/cubrid:11.2
+docker run -d --name cubrid-verify-dashboard -p 127.0.0.1:33006:33000 -e CUBRID_DB=testdb cubrid/cubrid:11.2
+export CUBRID_TEST_URL=cubrid+pycubrid://dba@localhost:33005/testdb
+export CUBRID_DASHBOARD_TEST_URL=cubrid+pycubrid://dba@localhost:33006/testdb
+make verify
+docker rm -f cubrid-verify cubrid-verify-dashboard
+```
+
+Wait until the containers accept connections before running a lane (the gate
+reports them as unreachable otherwise). A full run took about 6.5 minutes on
+CUBRID 11.2. `make verify` first checks every URL, every server and the installed
+example dependencies, and runs nothing if one of them fails. The lanes fail closed
+(`CUBRID_LIVE_GATE=1` by default; `1`/`true`/`yes`/`on` enable it,
+empty/`0`/`false`/`no`/`off` disable it, any other value is a usage error). Under
+the gate a lane fails, with a nonzero exit, when:
+
+- a URL it needs is missing, unreachable or not `cubrid+pycubrid://` (no SQLite
+  fallback), names the `make up` database, or the dashboard URL names the same
+  database as `CUBRID_TEST_URL`; or the `make up` database is unreachable;
+- a dedicated database already holds any `cookbook_*` table before the lane: the
+  suites drop and recreate their own tables, so use a dedicated, empty database;
+- any suite fails, collects no test or skips a test, or a suite whose conftest prints a
+  database header (the Flask, FastAPI recipe and dashboard suites) does not print
+  `database: live CUBRID (...)`. The Django and async-worker suites print no header:
+  they skip without `CUBRID_TEST_URL` (a gate failure) and fail on a
+  non-`cubrid+pycubrid` URL;
+- a suite leaves new tables behind or drops a table that existed before it ran
+  (compared with a snapshot taken just before that suite; the quickstart may keep
+  its own table);
+- a golden fails, is skipped, or no golden ran.
+
+The gate also drops `PYTEST_ADDOPTS` and `PYTEST_PLUGINS` from the suites'
+environment. Only a gated run can PASS: `CUBRID_LIVE_GATE=0 make verify-django-celery` keeps the
+suites' own skips and SQLite fallbacks for exploration, and its summary says
+INCOMPLETE at best. The full `make verify` always runs gated, whatever
+`CUBRID_LIVE_GATE` says; run directly without the gate, `scripts/live_gate.py all`
+exits 3 for INCOMPLETE, never 0. The summaries count the root FastAPI template's
+SQLite startup test apart from the live totals (`non_live_totals`). After an interrupted run, drop the leftover `cookbook_*` tables
+in the dedicated databases or use fresh containers.
+
+Each lane replaces only `.live-evidence/<lane>/` (ignored by version control; other
+lanes' files there are kept) with one JUnit XML file and log per suite (the golden
+lane keeps its log and a `results.tsv` with one line per golden) plus `summary.json` and
+`summary.txt`: the commands, commit SHA, the Python, driver and framework versions of the
+interpreter that runs pytest (`PYTHON`), the CUBRID server versions and the
+selected/passed/failed/skipped counts and case outcomes per suite. `make verify` also
+writes `.live-evidence/verify-summary.json` and `verify-summary.txt`, which report the
+golden comparisons and the pytest lanes separately and name every failed golden.
+
+`make verify` is always the full verification: an exported `VERIFY_PATHS` does not
+narrow it, and `make verify VERIFY_PATHS=<dirs>` on the command line fails with a
+one-line message that names `make verify-goldens VERIFY_PATHS=<dirs>`, the partial
+check of only the goldens under those roots (#437). CI calls the same targets: `smoke-test.yml` runs the
+full `make verify` on CUBRID 11.2 and 11.4, and the pull-request smoke lanes run
+`make verify-goldens VERIFY_PATHS=<roots>` and the focused `verify-*` lanes their
+changed paths select (see [CI tiers](#ci-tiers)). The other pull-request recipe
+jobs keep their own per-recipe environments.
+
 ### CI tiers
 
 Two workflows share live CUBRID validation (#222). `scripts/ci_scope.py`
@@ -151,10 +238,10 @@ unexpectedly skipped lane, or a failed classification, fails the gate.
 | Tier | When | What runs |
 |------|------|-----------|
 | 1 — cheap checks | every pull request | Ruff, `make check`, docs-sync, docs-check, doc-lint, classification and the gate; the strict docs-site build |
-| 2 — path-selected live lanes | pull requests | only the touched family on CUBRID 11.4 / Python 3.12: Flask/FastAPI → the changed recipes' own suites (representative suites for shared files, see below); dashboard, async-worker, Django → their suite; CQRS recipe → its pinned job; golden examples → `Smoke Tests (CUBRID 11.4)` with `make verify` scoped to the touched examples; AI-agent code or other files in example trees → the same lane with a full `make verify` |
-| 2 — fan-out | pull requests changing shared live infrastructure (`Makefile`, `docker-compose.yml`, `scripts/normalize_output.sh`, readiness/coverage scripts), `ci.yml`, `scripts/ci_scope.py` or `.github/actions/` | every live lane, both smoke lanes and CQRS on 11.2 + 11.4 with full `make verify`, Python 3.11 + 3.14 compatibility |
+| 2 — path-selected live lanes | pull requests | only the touched family on CUBRID 11.4 / Python 3.12: Flask/FastAPI → the changed recipes' own suites (representative suites for shared files, see below); dashboard, async-worker, Django → their suite; CQRS recipe → its pinned job; golden examples → `Smoke Tests (CUBRID 11.4)` with `make verify-goldens` scoped to the touched examples; the FastAPI quickstart, `performance/` (and `tests/test_performance_benchmarks.py`) or AI-agent code (and `tests/test_ai_agent.py`) → the same lane with every golden and the focused `make verify-quickstart` / `verify-performance` / `verify-ai-agent` lane; other files in example trees → the same lane with every golden and all three focused lanes |
+| 2 — fan-out | pull requests changing shared live infrastructure (`Makefile`, `docker-compose.yml`, `scripts/normalize_output.sh`, readiness/coverage scripts), `ci.yml`, `scripts/ci_scope.py` or `.github/actions/` | every live lane, both smoke lanes and CQRS on 11.2 + 11.4 with every golden (`make verify-goldens VERIFY_PATHS=.`) and all three focused lanes, Python 3.11 + 3.14 compatibility |
 | 3 — Python compatibility | push to `main`, weekly schedule, manual `ci.yml` run; pull requests changing `fundamentals/pycubrid`, `fundamentals/sqlalchemy` or fan-out paths | 3.11–3.14 on broad events; 3.11 + 3.14 endpoints on those pull requests |
-| 4 — broad smoke | `smoke-test.yml`: push to `main`, nightly schedule, manual run, release verification (`repository_dispatch` / `workflow_call`) | every golden plus all Flask/FastAPI, async-worker, Django and dashboard suites on CUBRID 11.2 + 11.4 (Python 3.12); a release verification adds one CUBRID 11.4 cell on Python 3.11, the supported minimum |
+| 4 — broad smoke | `smoke-test.yml`: push to `main`, nightly schedule, manual run, release verification (`repository_dispatch` / `workflow_call`) | the full, fail-closed `make verify` (every golden and every live suite: quickstart, migration and performance, Flask/FastAPI, Django/Celery, AI agent, dashboard), then `make verify-ai-agent` again, on job-owned CUBRID 11.2 + 11.4 containers (Python 3.12); a release verification adds one CUBRID 11.4 cell on Python 3.11, the supported minimum |
 
 - Docs-only pull requests (`*.md`, `docs/`, `mkdocs.yml`, …) start no live CUBRID,
   except `SUPPORT_MATRIX.md`, which documents the driver floors.
@@ -166,13 +253,28 @@ unexpectedly skipped lane, or a failed classification, fails the gate.
   weekly `ci.yml` schedule and on manual `ci.yml` runs — not on pushes to `main`,
   since the floors are fixed releases; edits to a lane directory's code do not select it, the weekly schedule covers them. One job, about 3 minutes.
   Unknown paths fail closed to every recipe family lane and the 11.4 smoke lane
-  with a full `make verify`.
+  with every golden (`make verify-goldens VERIFY_PATHS=.`) and all three focused
+  lanes.
 - CUBRID 11.2 runs on a pull request only for version-sensitive changes:
   `smoke-test.yml`, `scripts/release_smoke.py`, `scripts/mcp_smoke.py`, the
   fan-out paths, or recipe 10's `requirements.txt` (CQRS job only).
-- Example directories with no live consumer (`performance/`, the FastAPI
-  quickstart, `fundamentals/parameterized-queries`) are covered by the offline
-  checks only, on every event.
+- `fundamentals/parameterized-queries`, the only example directory with no live
+  consumer, is covered by the offline checks only, on every event.
+- The PR smoke lanes (`.github/actions/pr-smoke`) use the same commands as a
+  local run: `make deps` under the selected driver constraints,
+  `make verify-goldens VERIFY_PATHS=<roots>` for the scoped goldens, then the
+  focused lanes `scripts/ci_scope.py` names in `smoke_lanes`, one at a time on the
+  examples database: `make verify-quickstart` (about 1 s) for
+  `quickstart/5min-fastapi/` (other than Markdown), `make verify-performance` (about a
+  minute, bounded at 5 minutes) for `performance/` and
+  `tests/test_performance_benchmarks.py`, and `make verify-ai-agent` twice on a
+  second, dedicated CUBRID container (`CUBRID_TEST_URL`; about 20 s each) for
+  `templates/ai-agent/` and `tests/test_ai_agent.py` (#425, #426, #428). Each of
+  these paths runs every golden, even beside a changed golden root. Fan-out, CI
+  policy, release smoke, unknown paths and example-tree files outside a golden root
+  select all three lanes. Each smoke job uploads `.live-evidence/` once, as the
+  `live-evidence-pr-cubrid-<version>` artifact (also when it fails; an upload
+  failure never fails the lane).
 - The Flask/FastAPI lane (#227) runs the `tests/` suite of each changed recipe
   root (`ci_scope.web_suites`: a `templates/flask/` or
   `templates/api-service-fastapi/recipes/` recipe, or the root FastAPI app), each
@@ -198,6 +300,15 @@ unexpectedly skipped lane, or a failed classification, fails the gate.
   only in its CQRS job. Every selected suite must pass at least one test
   (checked on pytest's final summary line) within 10 minutes, or the lane and
   `CI Gate` fail.
+- `smoke-test.yml` runs the full `make verify` on three job-owned CUBRID
+  containers of the matrix version: the examples database (`localhost:33000`,
+  goldens, quickstart and performance), `CUBRID_TEST_URL` (`:33100`; web,
+  Django/Celery, AI agent) and `CUBRID_DASHBOARD_TEST_URL` (`:33200`). It never
+  passes `VERIFY_PATHS`, which `make verify` refuses on the command line. `make verify-ai-agent` then runs a second time on the same database, and
+  both runs keep their evidence (`ai-agent-run-1/`, `ai-agent-run-2/`). The job
+  uploads `.live-evidence/` once as `live-evidence-cubrid-<version>` (also when it
+  fails, with `continue-on-error` so the upload can never change the release
+  smoke result; a release workflow call uploads none into the caller's run).
 - `smoke-test.yml` does not run on pull requests, so no pull request repeats the
   broad 11.2/11.4 matrix. Its exact release verification inputs, outputs and
   fail-closed reporting are unchanged. To test a change to it before merging, run
@@ -263,7 +374,7 @@ lanes, and 60 for `smoke-test.yml`'s `verify` job, whose step-level timeouts add
 to 57 (plus a few untimed setup steps; the observed maximum is 4 minutes).
 Jobs that call the organization's reusable workflows (`doc-lint`, `live-smoke`)
 cannot set a timeout; those callees are an exact allowlist.
-`tests/test_workflow_timeouts.py` (run by `make check`) reads every workflow and
+`tests/test_workflow_timeouts.py` (run by `make test`) reads every workflow and
 fails when an executing job lacks a bounded timeout, when a new external caller is
 not allowlisted, or when `CI Gate` loses `if: always()` or its short timeout.
 
@@ -319,27 +430,31 @@ when switching incompatible versions, and never delete existing data implicitly.
 
 ### Golden Verification
 
-Runnable examples are checked against committed golden output with `make verify`,
+Runnable examples are checked against committed golden output with `make verify-goldens`
+(part of the full `make verify`),
 which discovers each committed `<dir>/expected/<name>.expected`, runs the matching
 `<dir>/<name>.py`, pipes it through `scripts/normalize_output.sh`, and diffs the
 result against that golden file. When you add a one-shot example, capture its
 golden output so CI can guard it.
 
-`make verify` checks all goldens by default; use `VERIFY_PATHS=<directory>` to
-select example roots. Empty/missing roots, zero golden targets, a missing script
+`make verify-goldens` checks all goldens by default; use `VERIFY_PATHS=<directory>` to
+select example roots (the pull-request smoke lanes and the driver-main canary call
+it this way); it is a partial check. `make verify VERIFY_PATHS=<directory>` fails and
+points to it. The comparison itself lives in `scripts/verify_goldens.sh`. Empty/missing roots, zero golden targets, a missing script
 for an expected file, discovery/read errors, and failed scripts or normalizers
 all fail the command. A successful summary has at least one pass and no failures
 or skips. Ordinary recipe failures are collected so the remaining selected
 recipes still produce diagnostics.
 
 To reproduce it from a clean checkout, use a Python 3.11+ virtual environment and
-run `make up`, `make deps`, `make verify`. `make deps` installs `pytest`,
-`sqlalchemy-cubrid[pycubrid]` and the `requirements.txt` of every golden-backed
-example (a directory that owns `expected/`) in one pip resolver call, so
-`PIP_CONSTRAINT` applies to all of them. The same discovery
-(`scripts/example_requirements.py`) backs `scripts/release_smoke.py
-install-examples` in CI; it fails, and so does `make deps`, if a
-golden-backed `requirements.txt` path contains whitespace. Before running anything, `make verify` checks that the
+run `make up`, `make deps`, `make verify-goldens`. `make deps` installs `pytest`,
+`pytest-asyncio`, `sqlalchemy-cubrid[pycubrid]` and the `requirements.txt` of every example (the
+golden-backed ones and those of the live suites, `scripts/example_requirements.py
+--all`) in one pip resolver call, so `PIP_CONSTRAINT` applies to all of them. The
+golden-backed discovery (a directory that owns `expected/`; the same script without
+`--all`) backs `scripts/release_smoke.py install-examples` in CI; it fails, and so
+does `make deps`, if a `requirements.txt` path contains whitespace. Before running
+anything, `make verify-goldens` checks that the
 selected examples' requirements are installed and stops once with "run
 `make deps` first" if not.
 
@@ -358,6 +473,34 @@ is an `EXEC-ERROR`),
 `✗ NORMALIZE-ERROR`, `✗ READ-ERROR` (golden read error) or `? SKIP`, and the
 summary counts each class. Under GitHub Actions each failure also emits an
 `::error file=...::` annotation.
+
+### Performance and migration lane
+
+`make verify-performance` (also part of `make verify`) runs
+`tests/test_performance_benchmarks.py` against the database
+the examples hard-code (`localhost:33000`, `testdb`, `dba`; `make up` and
+`make deps` first) and writes a JUnit report and a summary to `.live-evidence/performance/`
+(ignored by git). It has two groups, reported as separate JUnit classes:
+`TestMigrationGoldens` runs the five `migration/java-to-python` goldens with the
+`make verify` comparison (`scripts/run_example.py`, `scripts/normalize_output.sh`,
+`expected/*.expected`), and `TestPerformanceBenchmarks` runs the three
+`performance/*/benchmark.py` scripts. A benchmark passes when it exits 0 within
+its time limit, prints every comparison line with a finite, nonnegative time and
+the workload it was configured for, prints no error or traceback, and leaves no
+benchmark table behind, also when a failure is injected after the table is
+created; after each test that runs a script, an unrelated sentinel table must be
+unchanged (a failure names that test). Timings are never
+compared with each other or with a threshold, and never go into a golden. The
+report records the CUBRID server, Python, pytest and driver versions.
+The lane runs with `CUBRID_LIVE_GATE=1`: an unreachable database or a missing
+driver fails every database test (the run fails), and the lane also fails if
+the report counts a skipped test or the scripts leave or drop a table. The scripts use fixed table names
+(`cookbook_fetch_test`, `cookbook_bulk_test`, `cookbook_jdbc_*`,
+`cookbook_sensors`), so do not run `make verify-performance` at the same time as another
+`make verify-performance`, `make verify` or a manual benchmark run against the same database. Without the variable, `pytest tests/test_performance_benchmarks.py`
+skips when no database answers. A full run took about a minute on CUBRID 11.2
+(longer on slow machines; the `bulk-insert` per-row COMMIT dominates). When you
+change a benchmark, run it twice in a row to show that no stale table is left behind.
 
 This is enforced: `scripts/check_expected_coverage.py` (run by `make verify` and
 the smoke-test workflow) fails if any runnable `<dir>/*.py` inside a directory
@@ -675,6 +818,10 @@ and not missing coverage:
 | `performance/connection-pooling/benchmark.py` | Throughput benchmark — timings and speedup factors are nondeterministic. |
 | `performance/fetch-optimization/benchmark.py` | Throughput benchmark — per-strategy timings are nondeterministic. |
 
+The three benchmarks are checked live by `make verify-performance` instead (see
+[Performance and migration lane](#performance-and-migration-lane)), which parses their output without
+comparing timings.
+
 Where output is dynamic only in *presentation* (timings, absolute paths, peak
 memory), prefer adding a presentation-only rule to `scripts/normalize_output.sh`
 (see `make test-normalize`) so the example can be golden-captured instead of
@@ -876,143 +1023,27 @@ pinning the caller alone does not freeze those resources.
 
 ### Review Process
 
-- All PRs must complete the applicable AGENTS.md development-tool review route
-  before merge. Non-trivial OpenCode work records Oracle pre/post evidence;
-  trivial OpenCode edits may omit those reviews with a recorded reason.
-  Standalone Claude Code, Codex, ChatGPT and other agent tools require a
-  substantive submitted GitHub Copilot review or a maintainer's review
-  (2026-10-15). A pending request does not complete the route. Under every
-  route, changes to workflows that hold write permissions or that sibling
-  repositories call to verify a release (`smoke-test.yml`), and to
-  `scripts/release_smoke.py` or `scripts/mcp_smoke.py`, need a review that
-  explicitly assesses them, confirmed by a maintainer. Human contributions follow
-  ordinary review, and outstanding review threads need a disposition.
-- CI must pass (lint checks).
-- Examples must be tested against a live CUBRID instance.
-
-Explain unavailable local checks so maintainers can arrange validation. A reason
-or an AI review does not waive the CI or live checks required before merge.
-Outside contributors do not need internal AI tools, label permissions or live
-CUBRID access; when a required integration check is missing, maintainers own
-running it.
+- The review process is identical for people and all coding agents.
+  Required GitHub CI and relevant live CUBRID validation must pass.
+- Review correctness, tests, security, maintainability and scope.
+  AI review outputs are optional references, not mandatory approvals.
+- Maintainers verify the final code, document blocking findings and
+  make merge decisions. Changes to write-capable workflows, shared
+  release verification (`smoke-test.yml`) or release smoke scripts
+  require explicit independent security/invariant assessment.
+- Outside contributors do not need internal AI tooling, label rights
+  or database access. Maintainers arrange applicable hosted CI/lab checks.
 
 ### Agent-review evidence gate
 
-> **Advisory only. Never make `agent-review` a required status check in its
-> current form.** It is a GitHub Actions check, and a pull request can publish a
-> passing check with the same name: by editing `agent-review.yml` (GitHub runs
-> the PR's copy of the workflow) or by adding another workflow with an
-> `agent-review` job. The check cannot prove who produced it. It can become a
-> required check only once its verdict is posted from an identity a pull request
-> cannot impersonate, such as a GitHub App (#378; Refs cubrid-lab/cubrid-mcp-server#345). Until
-> then it is a reading aid for the reviewer and the maintainer who merges.
-
-`.github/workflows/agent-review.yml` publishes the `agent-review` check. The
-workflow and `scripts/agent_review_gate.py` are copies of the cubrid-mcp-server
-gate (Refs cubrid-lab/cubrid-mcp-server#341): only the repository constants
-block differs, so fixes can be copied across. It runs
-`scripts/agent_review_gate.py` from the base branch and decides only from the
-review records GitHub keeps for the pull request. It applies the review route
-of 2026-10-15: a substantive Copilot review or a maintainer's review. The PR
-body, its checkboxes and its declared development route, review requests, and CI
-results are never evidence; the route is only shown in the check summary. Every
-pull request is evaluated the same way, whichever tool or person wrote it, except
-the two exemptions below.
-
-A review counts only when it is submitted (not pending or dismissed), comes from
-an account that still exists, is not a self-review (the reviewer is not the PR
-author and authored no commit in the PR other than a merge commit that only
-brings in `main`), covers the current head, and comes from GitHub Copilot code
-review or a maintainer: a code owner listed in `MAINTAINERS`, which a test keeps
-equal to `.github/CODEOWNERS`. Other people, other bots and other AI agents are
-listed in the summary but never count.
-
-| Evidence at the head | Ordinary change | Protected path changed |
-|---|---|---|
-| Maintainer, `APPROVED` | passes | passes (the explicit authorization) |
-| Maintainer, `COMMENTED` that opens at least one inline thread | passes | not enough |
-| Maintainer, `COMMENTED` with body text only | not enough | not enough |
-| Copilot `COMMENTED`, substantive, AI round 1 or 2 | passes | not enough |
-| Copilot past the AI review budget, summary-only, or error/quota notice | not enough | not enough |
-| Nothing, a pending request, PR-body checkboxes, a self-review, anyone else | fails | fails |
-
-- **COMMENTED is not APPROVED.** A maintainer's `COMMENTED` review counts as an
-  assessment only when it opens an inline thread; the gate cannot judge body
-  text, so a maintainer who accepts a change without comments approves it.
-- **Substantive Copilot review.** It has inline comments, or its overview states
-  a verdict, an assessment sentence and an open-findings count. A summary of what
-  changed, or an error or quota notice, is not an assessment. A notice is not an
-  AI review round, so a quota failure may be re-requested; neither is an empty
-  record with no new thread, such as a reply to an existing thread.
-- **Stale reviews.** A review of an older commit counts only when the PR's change
-  against `main` is identical at that commit and at the head: the same files,
-  statuses and exact patches, hunk line numbers included, and for a file without
-  a patch (binary, too large, or a pure rename) the same blob SHA. An edit moved
-  to another place never inherits a review. An "Update branch" sync, needed
-  because `main` requires branches to be up to date, or a rebase that changes
-  nothing of the PR carries the review forward. When `main` changed lines above
-  or next to the PR's own change, the patch differs and the review is stale, and
-  the merge commit's author counts as a committer: fail closed, and ask for a new
-  review of the final head.
-- **AI review budget.** Each published Copilot review is one round, stale or not
-  (error and quota notices excepted). Rounds 1 and 2 can satisfy the gate. A
-  Copilot review does not count on its own once a PR has more than two Copilot
-  rounds, even an earlier round of the same head: at the budget limit the final
-  head needs a maintainer's review. A carry-forward spends no round.
-- **Protected paths (no bypass).** A change to any file under
-  `.github/workflows/` (including `smoke-test.yml`, which sibling repositories
-  call to verify their releases) or `.github/actions/`, to
-  `.github/dependabot.yml`, to the release smoke scripts `scripts/release_smoke.py`
-  and `scripts/mcp_smoke.py`, to the lane selection in `scripts/ci_scope.py`
-  (which CI lanes run) and `scripts/driver_floors.py` (which goldens the floor
-  lane runs), or to the gate itself (`scripts/agent_review_gate.py`,
-  `tests/test_agent_review_gate.py`) needs a maintainer's `APPROVED` review of
-  the head.
-- **Blocking findings.** A maintainer whose latest decision is
-  `CHANGES_REQUESTED` blocks, even one who also committed to the PR. Only threads
-  opened by Copilot or a maintainer are weighed. Among them, an unresolved
-  Copilot critical or high-severity finding, or a thread whose comments (replies
-  included) mention security, a vulnerability, an injection, credentials,
-  secrets, privileges or a bypass, blocks even when outdated, and so does such a
-  thread that the PR author resolved. Resolving a thread sends no workflow
-  event: re-run the `agent-review` job afterwards.
-- **Missing data fails closed.** Any API error, missing field or truncated
-  listing (250 or more commits, 3000 or more files, a compare of 300 or more
-  files) fails the check; re-run it. A review whose account was deleted is
-  ignored instead.
-- **Copilot's review does not start a run by itself.** GitHub holds a workflow
-  run that Copilot's review event triggers as "action required" and creates no
-  check for it. After Copilot reviews, re-run that waiting `agent-review` run
-  (Actions, or `gh api -X POST repos/cubrid-lab/cubrid-cookbook-python/actions/runs/<id>/rerun`)
-  or edit the PR body; both evaluate the current records. Each event adds
-  another `agent-review` check run on the same head. GitHub does not document
-  which of several same-named check runs a required check would use, which is a
-  second reason the check stays advisory: read the newest run.
-
-Exemptions, so dependency automation behaves as before:
-
-- **release-please candidates**: this repository has no release-please
-  configuration, so `RELEASE_FILES` is empty and no pull request is exempt as a
-  release candidate.
-- **Dependabot updates** (author `dependabot[bot]`, a `dependabot/` branch in this
-  repository) pass when every commit was created by Dependabot through GitHub
-  (author `dependabot[bot]`, committer `web-flow`, verified signature) or is a
-  merge that leaves the PR's change identical. Any other commit, an amended
-  Dependabot commit included, makes the pull request an ordinary one.
-
-Outside contributors' pull requests pass with a maintainer's review. A
-maintainer's own pull request needs Copilot code review or the other maintainer.
-
-**Fork pull requests.** The workflow uses `pull_request` and
-`pull_request_review` with a read-only token, never `pull_request_target`, and
-checks out nothing: no fork code runs with write access or secrets. Fork pull
-requests never get an exemption and never run their own copy of the script.
-`pull_request_target` would read the workflow from the base branch, but it runs
-with the repository's secrets and, unless every job narrows it, a write-capable
-token next to attacker-controlled input, and review events do not trigger it. A
-`workflow_run` relay would need a status-writing token, loses the PR number for
-forks, and its status context can still be posted by a same-repository PR. A
-first-time fork contributor's runs wait for a maintainer's approval as usual.
+`agent-review` is a non-blocking diagnostic of submitted review records.
+Its current script may describe legacy tool-dependent evidence; that
+classification is **not** the project's acceptance or merge policy.
+Reviewers can use its findings as context, but GitHub's required CI
+and the responsible maintainer's independent judgment decide readiness.
+A PR may spoof GitHub Actions checks of the same name, so this advisory
+check must not be added to required branch status checks.
+Retain safe read-only fork-workflow handling and maintainer run approvals.
 
 ### Code ownership
 

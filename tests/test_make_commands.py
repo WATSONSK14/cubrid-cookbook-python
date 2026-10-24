@@ -77,6 +77,7 @@ class VerifyCommandTests(OrphanChecks):
             "example_requirements.py",
             "normalize_output.sh",
             "run_example.py",
+            "verify_goldens.sh",
         ):
             shutil.copyfile(ROOT / "scripts" / name, scripts / name)
 
@@ -103,15 +104,19 @@ class VerifyCommandTests(OrphanChecks):
         normalize: str | None = None,
         timeout: int | None = None,
         stdin: str | None = None,
+        target: str = "verify-goldens",
+        python: str | None = None,
+        extra: tuple[str, ...] = (),
     ):
-        command = ["make", "--no-print-directory", "-f", str(ROOT / "Makefile"), "verify"]
-        command.append(f"PYTHON={sys.executable}")
+        command = ["make", "--no-print-directory", "-f", str(ROOT / "Makefile"), target]
+        command.append(f"PYTHON={python or sys.executable}")
         if paths is not None:
             command.append(f"VERIFY_PATHS={paths}")
         if normalize is not None:
             command.append(f"NORMALIZE={normalize}")
         if timeout is not None:
             command.append(f"VERIFY_TIMEOUT={timeout}")
+        command.extend(extra)
         return subprocess.run(
             command,
             cwd=self.root,
@@ -218,6 +223,50 @@ class VerifyCommandTests(OrphanChecks):
                 result = self.verify(paths)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"{count} passed, 0 failed, 0 skipped", result.stdout)
+
+    def recorder(self) -> Path:
+        recorder = self.root / "python"
+        recorder.write_text('#!/bin/sh\necho "ARGS $* GATE=$CUBRID_LIVE_GATE"\n', encoding="utf-8")
+        recorder.chmod(0o755)
+        return recorder
+
+    def test_verify_with_paths_on_the_command_line_fails_and_names_verify_goldens(self) -> None:
+        # #437: make verify never silently becomes the partial golden-only check.
+        self.example("first")
+        for paths in ("first", ".", ""):
+            with self.subTest(paths=paths):
+                result = self.verify(paths, target="verify", python=str(self.recorder()))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                message = [line for line in result.stderr.splitlines() if "ERROR" in line]
+                self.assertEqual(len(message), 1, result.stderr)
+                self.assertIn("make verify-goldens", message[0])
+                self.assertNotIn("ARGS", result.stdout)
+                self.assertNotIn("passed", result.stdout)
+
+    def test_verify_without_paths_runs_the_full_live_gate(self) -> None:
+        recorder = self.recorder()
+        base = {
+            k: v for k, v in os.environ.items() if k not in {"VERIFY_PATHS", "CUBRID_LIVE_GATE"}
+        }
+        # An exported VERIFY_PATHS (CI writes VERIFY_PATHS=. to GITHUB_ENV) and an
+        # ambient CUBRID_LIVE_GATE=0 must neither downgrade nor ungate a bare make verify.
+        for extra in ({}, {"VERIFY_PATHS": "first"}, {"CUBRID_LIVE_GATE": "0"}):
+            with self.subTest(env=extra):
+                result = self.verify(env={**base, **extra}, target="verify", python=str(recorder))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("ARGS scripts/live_gate.py --gate all GATE=1", result.stdout)
+                self.assertNotIn("Verifying example outputs", result.stdout)
+
+    def test_golden_results_are_recorded_for_the_live_gate(self) -> None:
+        self.example("first")
+        self.example("second", code="print('different')")
+        results = self.root / "results.tsv"
+        result = self.verify(env={**os.environ, "VERIFY_RESULTS": str(results)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            results.read_text(encoding="utf-8").splitlines(),
+            ["PASS\t./first/ok.py", "MISMATCH\t./second/ok.py"],
+        )
 
     def test_expected_file_names_with_spaces(self) -> None:
         self.example(name="two words")
@@ -341,26 +390,30 @@ def run_deps(cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 class DepsCommandTests(unittest.TestCase):
-    def test_installs_every_golden_root_requirements_in_one_call(self) -> None:
+    def test_installs_every_example_requirements_in_one_call(self) -> None:
         result = run_deps(ROOT)
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [line for line in result.stdout.splitlines() if line.startswith("PIP-ARGS ")]
         self.assertEqual(len(commands), 1, result.stdout)
         command = commands[0] + " "
         self.assertIn(" sqlalchemy-cubrid[pycubrid] ", command)
-        self.assertIn("PIP-ARGS install pytest ", command)
-        roots = sorted(
-            {
-                path.parent.parent.relative_to(ROOT)
-                for path in ROOT.glob("**/expected/*.expected")
-                if not any(part.startswith(".") for part in path.relative_to(ROOT).parts)
-            }
+        self.assertIn("PIP-ARGS install pytest pytest-asyncio ", command)
+        requirements = sorted(
+            path.relative_to(ROOT)
+            for path in ROOT.glob("**/requirements.txt")
+            if not any(part.startswith(".") for part in path.relative_to(ROOT).parts)
         )
-        self.assertTrue(roots)
-        with_requirements = [root for root in roots if (ROOT / root / "requirements.txt").is_file()]
-        self.assertTrue(with_requirements)
-        for root in with_requirements:
-            self.assertIn(f" -r {(root / 'requirements.txt').as_posix()} ", command)
+        # Golden-backed examples and the live suites that make verify runs.
+        for expected in (
+            "fundamentals/pycubrid/requirements.txt",
+            "quickstart/5min-fastapi/requirements.txt",
+            "templates/ai-agent/requirements.txt",
+            "templates/dashboard/requirements.txt",
+            "templates/django/requirements.txt",
+        ):
+            self.assertIn(Path(expected), requirements)
+        for path in requirements:
+            self.assertIn(f" -r {path.as_posix()} ", command)
 
     def test_requirements_path_with_whitespace_fails_make_deps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -400,17 +453,26 @@ class DepsCommandTests(unittest.TestCase):
                 (root / name / "requirements.txt").touch()
                 if golden:
                     (root / name / "expected").mkdir()
-            result = subprocess.run(
-                [sys.executable, str(ROOT / "scripts/example_requirements.py")],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=10,
+            result, every = (
+                subprocess.run(
+                    [sys.executable, str(ROOT / "scripts/example_requirements.py"), *flags],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                for flags in ((), ("--all",))
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.splitlines(),
             ["golden/requirements.txt", "nested/golden/requirements.txt"],
+        )
+        # --all (make deps) adds non-golden examples but still skips hidden directories.
+        self.assertEqual(every.returncode, 0, every.stderr)
+        self.assertEqual(
+            every.stdout.splitlines(),
+            ["golden/requirements.txt", "nested/golden/requirements.txt", "plain/requirements.txt"],
         )
 
 
@@ -490,6 +552,286 @@ class RunExampleTests(OrphanChecks):
             self.assertEqual(module.main(["--timeout", "0.25", "--", "true"]), 0)
         run.assert_called_once_with(["true"], 0.25)
 
+    # --- #365: plain CLI misuse (zero / negative / missing --timeout, no command) ---
+
+    #: (argv in front of the child, the usage text the parser must print on POSIX)
+    #: Every case here has to be refused before spawning, so none of them is a
+    #: valid invocation: a well-formed timeout with a command would run the child.
+    REJECTED = (
+        (["--timeout", "0"], "finite positive --timeout"),
+        (["--timeout", "-1"], "finite positive --timeout"),
+        (["--timeout", "0.0"], "finite positive --timeout"),
+        (["--timeout", "-0.5"], "finite positive --timeout"),
+        ([], "the following arguments are required: --timeout"),
+    )
+
+    def cli_child(self) -> tuple[Path, str]:
+        """A child that leaves a marker file behind if the runner ever spawns it."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        marker = Path(directory.name) / "child-started"
+        code = f"import time; open({str(marker)!r}, 'w').write('x'); time.sleep(60)"
+        return marker, code
+
+    def test_nonpositive_and_missing_arguments_exit_2_without_spawning(self) -> None:
+        marker, code = self.cli_child()
+        for arguments, expected in self.REJECTED:
+            with self.subTest(arguments=arguments):
+                marker.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "scripts/run_example.py"),
+                        *arguments,
+                        "--",
+                        sys.executable,
+                        "-c",
+                        code,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(
+                    marker.exists(),
+                    f"{arguments} spawned the child: {result.stdout}{result.stderr}",
+                )
+                if os.name == "posix":
+                    self.assertIn(expected, result.stderr)
+
+    def test_cli_validation_reaches_the_parser_before_run_on_a_posix_host(self) -> None:
+        # The subprocess test above can only check the usage wording where the
+        # host is POSIX, because main() returns early elsewhere. These are the
+        # same five cases asserted on every platform, in the style of
+        # test_non_finite_timeout_is_a_usage_error_before_any_command_runs.
+        module = self._load_run_example()
+        cases = (
+            *(
+                ([*arguments, "--", "never-executed"], expected)
+                for arguments, expected in self.REJECTED[:-1]
+            ),
+            (["--timeout", "5", "--"], "finite positive --timeout"),
+            (["never-executed"], "the following arguments are required: --timeout"),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(module.os, "name", "posix"),
+                    mock.patch.object(module, "run") as run,
+                    mock.patch.object(module.subprocess, "Popen") as popen,
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    module.main(argv)
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
+                run.assert_not_called()
+                popen.assert_not_called()
+
+
+def make_dry_run(target: str, *extra: str, cwd: Path = ROOT) -> list[str]:
+    """The recipe lines `make -n` would run for ``target`` (prerequisites included)."""
+    result = subprocess.run(
+        ["make", "--no-print-directory", "-n", "-f", str(ROOT / "Makefile"), target, *extra],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.splitlines()
+
+
+def make_rule(target: str) -> str:
+    """The Makefile rule of ``target``: its header line and recipe lines."""
+    lines = (ROOT / "Makefile").read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(f"{target}:"))
+    end = start + 1
+    while end < len(lines) and (lines[end].startswith(("\t", "ifeq", "endif")) or not lines[end]):
+        if not lines[end]:
+            break
+        end += 1
+    return "\n".join(lines[start:end])
+
+
+class MakeTargetSemanticsTests(unittest.TestCase):
+    """#437: predictable target names; only docker-clean destroys data."""
+
+    def test_clean_removes_generated_files_but_never_touches_docker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            shutil.copyfile(ROOT / "scripts/stage_docs.py", root / "scripts/stage_docs.py")
+            calls = root / "docker-calls"
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in ("docker", "docker-compose"):
+                fake = binaries / name
+                fake.write_text(f'#!/bin/sh\necho "{name} $*" >> {calls}\n', encoding="utf-8")
+                fake.chmod(0o755)
+            generated = [
+                ".live-evidence/all/summary.json",
+                ".pytest_cache/v/cache/nodeids",
+                ".ruff_cache/CACHEDIR.TAG",
+                "site/index.html",
+                "recipes/__pycache__/ok.cpython-312.pyc",
+                "recipes/.pytest_cache/README.md",
+                "docs/catalog.md",
+                "docs/support-matrix.md",
+            ]
+            kept = ["recipes/ok.py", "docs/index.md", "docs/ko/getting-started.md", "README.md"]
+            for name in generated + kept:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text("x\n", encoding="utf-8")
+            result = subprocess.run(
+                ["make", "--no-print-directory", "-f", str(ROOT / "Makefile"), "clean"]
+                + [f"PYTHON={sys.executable}"],
+                cwd=root,
+                env={**os.environ, "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for name in generated:
+                self.assertFalse((root / name).exists(), name)
+            for name in kept:
+                self.assertTrue((root / name).exists(), name)
+            self.assertFalse(calls.exists(), "make clean ran docker")
+        self.assertNotIn("DOCKER_COMPOSE", make_rule("clean"))
+        self.assertFalse(any("docker" in line for line in make_dry_run("clean")))
+
+    def test_docker_clean_is_the_only_destructive_target(self) -> None:
+        self.assertEqual(
+            make_dry_run("docker-clean", "DOCKER_COMPOSE=docker compose")[0],
+            "docker compose down -v",
+        )
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertEqual(makefile.count("down -v"), 1)
+        self.assertIn("down -v", make_rule("docker-clean"))
+        # up and down keep their names and down keeps the data.
+        self.assertEqual(make_dry_run("down"), ["docker compose down"])
+        self.assertEqual(make_dry_run("up")[0], "docker compose up -d")
+
+    def test_test_recipe_is_one_runner_invocation_that_includes_test_normalize(self) -> None:
+        for target in ("test", "test-offline"):
+            with self.subTest(target=target):
+                self.assertEqual(
+                    make_dry_run(target, "PYTHON=python3"),
+                    ["python3 scripts/run_offline_tests.py"],
+                )
+        listed = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/run_offline_tests.py"), "--list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        commands = listed.stdout.splitlines()
+        self.assertIn("bash scripts/test_normalize_output.sh", commands)
+        self.assertIn(
+            f"{sys.executable} -m unittest discover -s tests -p test_make_commands.py -v",
+            commands,
+        )
+        # One process per suite: every listed command names exactly one suite.
+        self.assertEqual(len(commands), len(set(commands)))
+        self.assertGreaterEqual(len(commands), 25)
+
+    def test_runner_stops_at_the_first_failing_suite(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "run_offline_tests", ROOT / "scripts/run_offline_tests.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        ran: list[list[str]] = []
+
+        def fake_run(command, cwd):  # noqa: ANN001, ANN202
+            ran.append(command)
+            return subprocess.CompletedProcess(command, 3 if len(ran) == 2 else 0)
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(module.subprocess, "run", fake_run),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(module.main([]), 1)
+        self.assertEqual(len(ran), 2)
+        self.assertIn("FAILED (exit 3)", stderr.getvalue())
+
+    def test_verify_goldens_recipe_is_one_script_invocation(self) -> None:
+        rule = make_rule("verify-goldens")
+        recipe = [line for line in rule.splitlines()[1:] if line.strip()]
+        self.assertEqual(len(recipe), 1, rule)
+        self.assertIn("bash scripts/verify_goldens.sh $(VERIFY_PATHS)", recipe[0])
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        for classification in ("MISMATCH", "EXEC-ERROR", "⏱ TIMEOUT", "Results:", "::error"):
+            self.assertNotIn(classification, makefile)
+
+    def test_check_runs_no_tests(self) -> None:
+        self.assertTrue(
+            make_rule("check").startswith("check: lint format-check check-docs check-coverage ##"),
+            make_rule("check"),
+        )
+        lines = make_dry_run("check", "PYTHON=python3")
+        joined = "\n".join(lines)
+        self.assertNotIn("run_offline_tests.py", joined)
+        self.assertNotIn("test_normalize_output.sh", joined)
+        self.assertNotIn("-m pytest", joined)
+
+    def test_only_format_rewrites_files(self) -> None:
+        self.assertEqual(make_dry_run("lint", "RUFF=ruff"), ["ruff check ."])
+        self.assertEqual(make_dry_run("format-check", "RUFF=ruff"), ["ruff format --check ."])
+        self.assertEqual(
+            make_dry_run("format", "RUFF=ruff"), ["ruff check --fix .", "ruff format ."]
+        )
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertEqual(makefile.count("--fix"), 1)
+        self.assertEqual(makefile.count("$(RUFF) format .\n"), 1)
+
+    def test_focused_live_lanes_are_unchanged(self) -> None:
+        lanes = {
+            "verify-quickstart": "quickstart",
+            "verify-performance": "performance",
+            "verify-web": "web",
+            "verify-django-celery": "django-celery",
+            "verify-ai-agent": "ai-agent",
+            "verify-dashboard": "dashboard",
+            "verify-templates": "web django-celery dashboard",
+        }
+        for target, lane in lanes.items():
+            with self.subTest(target=target):
+                self.assertEqual(
+                    make_dry_run(target, "PYTHON=python3"),
+                    [f"CUBRID_LIVE_GATE=1 python3 scripts/live_gate.py {lane}"],
+                )
+
+    def test_help_groups_contributor_commands(self) -> None:
+        result = subprocess.run(
+            ["make", "--no-print-directory", "-f", str(ROOT / "Makefile"), "help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = result.stdout
+        groups = [
+            "Database",
+            "Offline tests",
+            "Live verification",
+            "Quality checks",
+            "Documentation",
+        ]
+        positions = [text.index(group) for group in groups]
+        self.assertEqual(positions, sorted(positions))
+        for group, target in zip(
+            groups, ("docker-clean", "test-offline", "verify-goldens", "format-check", "docs-check")
+        ):
+            self.assertLess(text.index(group), text.index(target))
+
 
 class OfflineWorkflowTests(unittest.TestCase):
     def test_python_compatibility_is_a_small_classified_live_matrix(self) -> None:
@@ -538,9 +880,15 @@ class OfflineWorkflowTests(unittest.TestCase):
                 )
                 self.assertEqual(check.returncode == 0, result == "success", check.stdout)
 
-    def test_ci_runs_the_contributor_aggregate(self) -> None:
+    def test_ci_runs_the_quality_gate_and_the_offline_tests(self) -> None:
+        # make check runs no tests (#437), so CI names make test as well.
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        self.assertIn("run: make check", workflow)
+        self.assertIn("run: make check test\n", workflow)
+
+    def test_driver_main_runs_the_partial_golden_check_by_its_own_name(self) -> None:
+        workflow = (ROOT / ".github/workflows/driver-main.yml").read_text(encoding="utf-8")
+        self.assertIn('make verify-goldens VERIFY_PATHS="$RECIPES"', workflow)
+        self.assertNotIn("make verify VERIFY_PATHS", workflow)
 
     def test_required_smoke_runs_command_guards_before_dependency_selection(self) -> None:
         workflow = (ROOT / ".github/workflows/smoke-test.yml").read_text(encoding="utf-8")
@@ -572,24 +920,6 @@ class OfflineWorkflowTests(unittest.TestCase):
         self.assertIn("templates/async-worker/tests", workflow[worker:gate])
         self.assertIn("async-worker-pytest", workflow[gate:])
 
-    def test_async_worker_smoke_runs_after_verify_under_frozen_driver_constraints(self) -> None:
-        workflow = (ROOT / ".github/workflows/smoke-test.yml").read_text(encoding="utf-8")
-        freeze = workflow.index("name: Freeze selected driver releases")
-        install = workflow.index("name: Install pytest suite dependencies")
-        verify_drivers = workflow.index("name: Record tested versions")
-        verify_examples = workflow.index("name: Run make verify")
-        worker = workflow.index("name: Run async-worker database tasks")
-        dashboard_switch = workflow.index("name: Start isolated dashboard CUBRID")
-        self.assertLess(freeze, install)
-        self.assertLess(install, verify_drivers)
-        self.assertLess(verify_drivers, verify_examples)
-        self.assertLess(verify_examples, worker)
-        self.assertLess(worker, dashboard_switch)
-        self.assertIn("templates/async-worker/requirements.txt", workflow[install:verify_drivers])
-        self.assertIn("templates/async-worker/tests", workflow[worker:dashboard_switch])
-        self.assertIn("CUBRID_TEST_URL:", workflow[worker:dashboard_switch])
-        self.assertNotIn("continue-on-error", workflow[worker:dashboard_switch])
-
     def test_django_bridge_has_its_own_required_live_cubrid_job(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         django = workflow.index("  django-bridge-pytest:")
@@ -599,42 +929,44 @@ class OfflineWorkflowTests(unittest.TestCase):
         self.assertIn("templates/django/tests", workflow[django:gate])
         self.assertIn("django-bridge-pytest", workflow[gate:])
 
-    def test_django_smoke_runs_after_colliding_recipes_under_frozen_constraints(self) -> None:
+    def test_broad_smoke_runs_full_verify_on_job_owned_databases(self) -> None:
+        # smoke-test.yml runs the full, fail-closed make verify (scripts/live_gate.py
+        # all): goldens, quickstart, performance, web, Django/Celery, AI agent and
+        # the dashboard, each live suite on its own job-owned CUBRID (#416).
         workflow = (ROOT / ".github/workflows/smoke-test.yml").read_text(encoding="utf-8")
-        install = workflow.index("name: Install pytest suite dependencies")
-        verify_drivers = workflow.index("name: Record tested versions")
-        verify_examples = workflow.index("name: Run make verify")
-        framework_suites = workflow.index("name: Run Flask and FastAPI pytest suites")
-        django = workflow.index("name: Run Django SQLAlchemy bridge")
-        dashboard_switch = workflow.index("name: Start isolated dashboard CUBRID")
-        self.assertLess(install, verify_drivers)
-        self.assertLess(verify_examples, framework_suites)
-        self.assertLess(framework_suites, django)
-        self.assertLess(django, dashboard_switch)
-        self.assertIn("templates/django/requirements.txt", workflow[install:verify_drivers])
-        self.assertIn("templates/django/tests", workflow[django:dashboard_switch])
-        self.assertIn("CUBRID_TEST_URL:", workflow[django:dashboard_switch])
-        self.assertNotIn("continue-on-error", workflow[django:dashboard_switch])
-
-    def test_dashboard_smoke_uses_separate_owned_container_after_other_suites(self) -> None:
-        workflow = (ROOT / ".github/workflows/smoke-test.yml").read_text(encoding="utf-8")
-        suites = workflow.index("name: Run Flask and FastAPI pytest suites")
-        start = workflow.index("name: Start isolated dashboard CUBRID")
-        readiness = workflow.index("name: Wait for isolated dashboard CUBRID")
-        dashboard = workflow.index("name: Run isolated Streamlit dashboard pytest suite")
-        cleanup = workflow.index("name: Remove owned dashboard CUBRID container")
+        start = workflow.index("name: Start CUBRID containers")
+        deps = workflow.index("name: Install verification dependencies")
+        recorded = workflow.index("name: Record tested versions")
+        verify = workflow.index("name: Run make verify")
+        repeat = workflow.index("name: Repeat the AI agent lane")
+        upload = workflow.index("name: Upload live evidence")
         report = workflow.index("name: Report release smoke result")
-        self.assertLess(suites, start)
-        self.assertLess(start, readiness)
-        self.assertLess(readiness, dashboard)
-        self.assertLess(dashboard, cleanup)
-        self.assertLess(cleanup, report)
-        self.assertNotIn("templates/dashboard/tests", workflow[suites:start])
-        self.assertIn("templates/dashboard/tests", workflow[dashboard:cleanup])
-        self.assertIn("timeout 5s docker exec", workflow[readiness:dashboard])
-        self.assertIn("pycubrid.connect(", workflow[readiness:dashboard])
-        self.assertIn("if: always()", workflow[cleanup:report])
-        self.assertIn('docker rm -f "$dashboard_id"', workflow[cleanup:report])
+        self.assertLess(start, deps)
+        self.assertLess(deps, recorded)
+        self.assertLess(recorded, verify)
+        self.assertLess(verify, repeat)
+        self.assertLess(repeat, upload)
+        self.assertLess(upload, report)
+        for spec in ("cubrid:33000", "cubrid-live:33100", "cubrid-dashboard:33200"):
+            self.assertIn(spec, workflow[start:deps])
+        step = workflow[verify:repeat]
+        self.assertIn("\n          make verify || status=$?\n", step)
+        self.assertIn("CUBRID_TEST_URL: cubrid+pycubrid://dba@localhost:33100/testdb", step)
+        self.assertIn(
+            "CUBRID_DASHBOARD_TEST_URL: cubrid+pycubrid://dba@localhost:33200/testdb", step
+        )
+        # The broad smoke never names VERIFY_PATHS: on the command line make verify
+        # refuses it (#437), and the run must cover every golden.
+        self.assertNotIn("VERIFY_PATHS=", workflow)
+        self.assertNotIn("VERIFY_PATHS:", workflow)
+        self.assertNotIn("continue-on-error", workflow[start:upload])
+        # Two sequential AI agent runs on the same database, both kept (#426).
+        self.assertIn("make verify-ai-agent", workflow[repeat:upload])
+        self.assertIn(".live-evidence/ai-agent-run-1", workflow[repeat:upload])
+        self.assertIn(".live-evidence/ai-agent-run-2", workflow[repeat:upload])
+        # The dashboard gets its own database instead of replacing the examples one.
+        self.assertNotIn("docker stop", workflow)
+        self.assertNotIn("templates/dashboard/tests", workflow)
         self.assertIn("if: always()", workflow[report:])
         self.assertIn("SMOKE_RESULT: ${{ job.status }}", workflow[report:])
 

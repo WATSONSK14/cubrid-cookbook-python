@@ -163,6 +163,34 @@ def workflow_installs() -> set[str]:
     return names
 
 
+class RequirementNameCanonicalization(unittest.TestCase):
+    """#363: the inventory keys on canonical(), so its folding rules are pinned here.
+
+    `scripts/build_license_inventory.py:canonical()` is what makes one declaration of
+    `zope.interface` and another of `zope-interface` count as the same package. These
+    cases pin the rule directly instead of relying on live declarations that happen to
+    exercise it; the generator's behavior is not changed by them.
+    """
+
+    def test_case_and_all_three_separators_fold_to_one_name(self) -> None:
+        for spelling in ("Foo_Bar", "foo.bar", "FOO--BAR", "foo-_bar", "FOO..BAR"):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(build.canonical(spelling), "foo-bar")
+
+    def test_a_name_without_separators_only_changes_case(self) -> None:
+        self.assertEqual(build.canonical("Zope"), "zope")
+        self.assertEqual(build.canonical("SQLAlchemy"), "sqlalchemy")
+
+    def test_longer_separator_runs_collapse_to_a_single_hyphen(self) -> None:
+        self.assertEqual(build.canonical("a___b----c....d"), "a-b-c-d")
+
+    def test_canonical_is_idempotent(self) -> None:
+        for spelling in ("Foo_Bar", "foo.bar", "FOO--BAR", "Zope", "a___b----c"):
+            with self.subTest(spelling=spelling):
+                once = build.canonical(spelling)
+                self.assertEqual(build.canonical(once), once)
+
+
 class RequirementCoverage(unittest.TestCase):
     def test_every_requirements_file_is_in_exactly_one_set(self) -> None:
         listed = [p for paths, _ in set_table().values() for p in paths]

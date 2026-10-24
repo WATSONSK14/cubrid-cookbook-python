@@ -72,20 +72,60 @@ CUBRID_TEST_URL="cubrid+pycubrid://dba@localhost:33000/testdb" \
 
 The live suite requires a dedicated test database: before and after each
 script it drops only that script's `agent_*`, `rag_*`, or `chat_*` tables
-(foreign-key children first), plus `cookbook_agent_products` for recipe 04.
+(foreign-key children first), plus `cookbook_agent_products` for recipe 04; the
+MCP case (02) drops the agent-state tables it uses as its read-only target.
 It restores environment variables and always uses the pycubrid SQLAlchemy
 backend, even if the supplied URL uses the legacy `cubrid://` scheme.
+
+After each run a separate connection reads back what the script persisted and
+compares it with explicit expectations in `tests/test_ai_agent.py`, ignoring
+auto-increment IDs and timestamps and resolving foreign keys through joins:
+
+- **01** — the `cookbook-agent-state-demo` session, its tags, its three messages
+  (with the assistant's JSON metadata) and its tool call, and the table row counts.
+- **02** — an in-process MCP session checks the `initialize`
+  handshake, that `tools/list` exposes the tools in `scripts/mcp_smoke.py`, that
+  `all_table_names` returns the same owner-qualified list of user tables as `db_class` (structured
+  result) and that `SELECT COUNT(*)` works; the rejected `DROP TABLE` leaves the
+  target table and its sentinel row in place, checked without the MCP server.
+- **03** — each sample document's source, metadata, tags and chunk count, each
+  chunk's token count and `embedding_ref`, and the latest retrieval-log row
+  (query, retrieved document, response, scores).
+- **04** — the agent-loop session's nine messages and three tool calls in order,
+  the product rows, and the row counts; the database-dependent table list and
+  timings are masked.
+- **05** — the demo user's preferences, its conversation and the four messages
+  with turn numbers and token counts.
+
 A second live case runs each script twice without resetting its tables, so a
 rerun on the same database is covered too; between the runs it inserts a
 reader's look-alike row (session key `demo-001`, username `alice`, a document
-with a sample source URL) and checks that the rerun keeps it.
-Without `CUBRID_TEST_URL`, the ten live cases skip; offline tests still run.
+with a sample source URL) and checks that the rerun keeps it. The second run
+must leave the same state as the first, with new root-row IDs (the old
+fixed-key rows were deleted, not reused); the retrieval log of recipe 03 is
+append-only and gains one row per run.
+Without `CUBRID_TEST_URL`, the eleven live cases skip; offline tests still run.
 Each script runs in its own process with a 60-second limit; cleanup connections
-have a 10-second connect timeout and a 15-second read timeout. The smoke-test
-matrix runs the suite twice on both CUBRID 11.2 and 11.4 for every `main` push,
-the nightly schedule and release verification, and the CUBRID 11.4 pull-request
-smoke lane runs it twice when a pull request touches this template or golden
-examples, to catch stale demonstration keys after teardown.
+have a 10-second connect timeout and a 15-second read timeout. CI runs the
+live suite through the same commands, twice on the same dedicated database to
+catch stale demonstration keys after teardown: the smoke-test matrix runs the
+full `make verify` and then `make verify-ai-agent` on both CUBRID 11.2 and 11.4
+for every `main` push, the nightly schedule and release verification, and the
+CUBRID 11.4 pull-request smoke lane runs `make verify-ai-agent` twice when a pull
+request touches this template or its tests. Both runs keep their evidence
+(`.live-evidence/ai-agent-run-1/` and `-run-2/` in the `live-evidence-*` workflow
+artifact; not for a release workflow call).
+
+`make verify-ai-agent` (also part of the full `make verify`) runs the live suite
+fail-closed (`CUBRID_LIVE_GATE=1`): a missing `CUBRID_TEST_URL`, an unreachable
+database, a database that already holds `cookbook_*` tables, a table left behind or
+any skipped case fails, and the JUnit report and a summary are written to
+`.live-evidence/ai-agent/`. Point it at a dedicated, empty database, not the
+`make up` database the golden examples use; `make test` runs the offline suite:
+
+```bash
+CUBRID_TEST_URL="cubrid+pycubrid://dba@localhost:33005/testdb" make verify-ai-agent
+```
 
 ## Architecture
 

@@ -38,7 +38,8 @@ Usage::
 directory, runs the offline and hidden commands, records each pytest outcome and
 removes the worktree. It needs the base SHA in the local clone. ``run --live``
 also runs the task's live checks through the worktree's ``make up`` /
-``make verify`` / ``make clean`` and records the CUBRID image and server version,
+``make verify`` / ``make docker-clean`` (``make clean`` at a base SHA that predates
+it) and records the CUBRID image and server version,
 the current ``scripts/ci_scope.py`` selection and the exact commands. ``prompt``,
 ``record`` and ``summarize`` support manual agent runs (see the README); nothing
 here starts an agent.
@@ -96,7 +97,10 @@ TASK_KEYS = {
 PYTEST = "python -m pytest "
 # Live commands are the repository's own runners: ``make verify`` for goldens and
 # a recipe's pytest suite. The grader never runs them; ``run`` does not either.
-LIVE_PREFIXES = ("make verify ", PYTEST)
+# ``make verify-goldens`` is the golden check from #437 on (#440); older base SHAs
+# record ``make verify VERIFY_PATHS=...``. Both print the same golden summary.
+GOLDEN_TARGETS = ("verify", "verify-goldens")
+LIVE_PREFIXES = (*(f"make {target} " for target in GOLDEN_TARGETS), PYTEST)
 COMMAND_KINDS = ("offline", "hidden", "live")
 OUTCOMES = ("passed", "skipped", "failed")
 # Directories whose Python files are user-facing examples (tests/ excluded).
@@ -401,7 +405,10 @@ def validate_task(task: Any, where: str = "task") -> list[str]:
         if not isinstance(live, list) or not all(
             isinstance(c, str) and c.startswith(LIVE_PREFIXES) for c in live
         ):
-            errors.append(f"{where}: validation.live must list 'make verify'/pytest commands")
+            errors.append(
+                f"{where}: validation.live must list 'make verify'/'make verify-goldens'/"
+                "pytest commands"
+            )
     docs = task.get("docs")
     if not isinstance(docs, list) or not all(
         isinstance(group, list) and group and all(isinstance(g, str) and g for g in group)
@@ -775,7 +782,7 @@ def run(
 
     The offline and hidden tests always run. With ``live`` the task's live checks
     also run, through the worktree's own ``make up`` / ``make verify`` /
-    ``make clean`` (see ``_live``).
+    ``make docker-clean`` or ``make clean`` (see ``_live``).
     """
     commands = [(c, "offline") for c in task["validation"]["offline"]]
     commands += [(c, "hidden") for c in hidden_commands(task)]
@@ -1095,6 +1102,20 @@ def verify_outcome(exit_code: int, output: str) -> str:
     return "failed"
 
 
+def _volume_cleanup_target(worktree: Path) -> str:
+    """The worktree Makefile's target that removes the lab's containers and volumes.
+
+    ``make docker-clean`` since #437, where ``make clean`` stopped touching Docker.
+    The tasks' older base SHAs have no ``docker-clean``; there ``make clean`` still
+    runs ``docker compose down -v``.
+    """
+    try:
+        makefile = (worktree / "Makefile").read_text(encoding="utf-8")
+    except OSError:
+        return "clean"
+    return "docker-clean" if re.search(r"^docker-clean:", makefile, re.MULTILINE) else "clean"
+
+
 def _live(
     task: dict[str, Any],
     patch: str,
@@ -1108,8 +1129,9 @@ def _live(
     It records the requested and the actual image, the server's ``cubrid_rel``
     line, the exact commands and the selection the current ``scripts/ci_scope.py``
     makes for the changed paths (``verify_paths`` and the suites), so a live result
-    can be compared with what CI would have run. ``make clean`` always runs last;
-    it also removes the run's volumes. Live outcomes are appended to ``commands``.
+    can be compared with what CI would have run. ``make docker-clean`` (``make
+    clean`` on a base SHA without it) always runs last and removes the run's
+    volumes. Live outcomes are appended to ``commands``.
     """
     changed = "".join(f"{path}\n" for path in sorted(parse_patch(patch)))
     scope = subprocess.run(
@@ -1163,16 +1185,13 @@ def _live(
                 )
                 continue
             argv = shlex.split(command)
+            golden = len(argv) > 1 and argv[0] == "make" and argv[1] in GOLDEN_TARGETS
             if argv[:1] == ["python"]:
                 argv[0] = sys.executable
-            elif argv[:2] == ["make", "verify"]:
+            elif golden:
                 argv.append(f"PYTHON={sys.executable}")
             done, output = _bounded(argv, worktree, timeout, env)
-            outcome = (
-                verify_outcome(done, output)
-                if argv[:2] == ["make", "verify"]
-                else pytest_outcome(done, output)
-            )
+            outcome = verify_outcome(done, output) if golden else pytest_outcome(done, output)
             commands.append(
                 {
                     "command": command,
@@ -1184,7 +1203,7 @@ def _live(
                 }
             )
     finally:
-        clean = ["make", "clean"]
+        clean = ["make", _volume_cleanup_target(worktree)]
         clean_code, _ = _bounded(clean, worktree, timeout, env)
         info["setup"].append({"command": shlex.join(clean), "exit_code": clean_code})
     return info

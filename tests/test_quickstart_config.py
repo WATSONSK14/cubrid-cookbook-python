@@ -33,6 +33,35 @@ def app_databases(text: str) -> set[str]:
     return {url or arg for url, arg in APP_DB.findall(text)}
 
 
+class TemplateDatabaseTests(unittest.TestCase):
+    def test_fastapi_template_creates_the_database_its_env_names(self) -> None:
+        # #412: the template created the image's default cubdb while .env.example
+        # named testdb, and its health check grepped for text 11.2 never prints.
+        template = ROOT / "templates" / "api-service-fastapi"
+        compose = (template / "docker-compose.yml").read_text(encoding="utf-8")
+        created = COMPOSE_DB.findall(compose)
+        self.assertEqual(len(created), 1, "expected one CUBRID_DB entry")
+        self.assertEqual(HEALTHCHECK_DB.findall(compose), created)
+        used = app_databases((template / ".env.example").read_text(encoding="utf-8"))
+        self.assertEqual(used, set(created))
+
+    def test_templates_survive_a_recreated_cubrid_container(self) -> None:
+        # #413: without a fixed host name, a recreated container cannot open the
+        # database its volumes keep (-353); 11.4 keeps it outside /var/lib/cubrid.
+        for name in ("api-service-fastapi", "dashboard"):
+            with self.subTest(template=name):
+                path = ROOT / "templates" / name / "docker-compose.yml"
+                compose = path.read_text(encoding="utf-8")
+                self.assertRegex(compose, r"\n    hostname: cubrid-[\w-]+\n")
+        dashboard = (ROOT / "templates" / "dashboard" / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        for volume in ("cubrid_data", "cubrid_databases"):
+            self.assertRegex(dashboard, rf"\n\s+- {volume}:/")
+            self.assertRegex(dashboard, rf"\nvolumes:\n(?:  \w+:\n)*  {volume}:\n")
+        self.assertIn("- cubrid_databases:/home/cubrid/CUBRID/databases", dashboard)
+
+
 class QuickstartDatabaseTests(unittest.TestCase):
     def quickstarts(self) -> list[Path]:
         found = sorted(p.parent for p in QUICKSTART.glob("*/docker-compose.yml"))

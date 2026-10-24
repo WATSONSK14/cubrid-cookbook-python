@@ -85,6 +85,35 @@ docker compose down                    # stop the database when finished
 Expect about 15 seconds for `fetch-optimization`, about 45 seconds for `bulk-insert` and a few seconds for
 `connection-pooling`. Absolute numbers depend on your hardware and CUBRID version.
 
+## Testing the benchmarks
+
+The benchmarks print timings, so they have no golden file. `make verify-performance` (also part of the full
+`make verify`; with the database above running and `make deps` installed) checks them instead, together with the five
+[Java → Python migration](../migration/java-to-python/) golden cases:
+
+```bash
+make verify-performance   # JUnit report and summary: .live-evidence/performance/
+```
+
+`tests/test_performance_benchmarks.py` runs each `benchmark.py` with a time limit and checks that it exits 0,
+prints every comparison line with a finite, nonnegative time, ran its whole workload (10,000 fetched rows per
+strategy; 500, 5,000 and 5,000 stored rows; 50 connections without a pool and 1 to 5 with one) and printed no
+error. It also makes `fetch-optimization` and `bulk-insert` fail on purpose after they create their table and
+checks that the table is dropped anyway, and that an unrelated table is unchanged after each run. It never
+compares one strategy's time with another's, so a slow or noisy machine does not fail it. The report records
+the CUBRID server, Python, pytest and driver versions. `make verify-performance` fails when the database is unreachable,
+any test is skipped or a table is left behind; plain `pytest tests/test_performance_benchmarks.py` skips without a database.
+
+The benchmarks and the migration examples use fixed table names (`cookbook_fetch_test`, `cookbook_bulk_test`,
+`cookbook_jdbc_*`, `cookbook_sensors`). Do not run `make verify-performance` at the same time as another `make verify-performance`,
+`make verify` or a manual benchmark run against the same database: they would drop each other's tables.
+
+CI runs the same commands, one lane at a time on job-owned CUBRID containers: the full `make verify` on
+CUBRID 11.2 and 11.4 for every push to `main`, the nightly schedule and release verification, and
+`make verify-performance` on CUBRID 11.4 for pull requests that change `performance/` or
+`tests/test_performance_benchmarks.py`. The lane took about a minute locally and is bounded at 5 minutes in
+the pull-request lane; its JUnit report and summary are in the `live-evidence-*` workflow artifact.
+
 ## Key Takeaways
 
 1. **≤ 500 rows** (historical, pycubrid 0.5.0): Network + server time dominates — client-side optimization has minimal effect

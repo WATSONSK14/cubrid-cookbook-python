@@ -46,6 +46,7 @@ jobs:
       smoke_114: ${{ steps.scope.outputs.smoke_114 }}
       smoke_112: ${{ steps.scope.outputs.smoke_112 }}
       verify_paths: ${{ steps.scope.outputs.verify_paths }}
+      smoke_lanes: ${{ steps.scope.outputs.smoke_lanes }}
       floors: ${{ steps.scope.outputs.floors }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -132,7 +133,8 @@ jobs:
           uv pip install --system -r quickstart/5min-fastapi/requirements.txt pytest httpx sqlalchemy ruff==0.16.4
           uv pip freeze --system
       - name: Run the contributor checks without a database
-        run: make check
+        # make check is the non-test quality gate; make test runs the offline suites.
+        run: make check test
 
   docs-sync:
     name: Docs sync gate
@@ -229,8 +231,9 @@ jobs:
       exclude: "node_modules/,typescript/node_modules/,vendor/"
       fail-on-issue: false  # advisory mode during initial rollout
 
-  # `make verify` is golden-file only and never runs the pytest suites, so
-  # recipe-level CUBRID-only breakage ships undetected (#131/#127). This job
+  # The PR smoke lanes' `make verify-goldens` compares golden files only and
+  # never runs these pytest suites, so recipe-level CUBRID-only breakage would
+  # ship undetected (#131/#127). This job
   # runs the Flask/FastAPI suites ci_scope.py selects (web_suites, #227) against
   # one live CUBRID 11.4: the changed recipes (up to MAX_WEB_SUITES), plus the
   # representative suites for shared Flask/FastAPI files and wider tiers.
@@ -525,6 +528,20 @@ jobs:
         with:
           cubrid-version: "11.4"
           verify-paths: ${{ needs.classify.outputs.verify_paths }}
+          live-lanes: ${{ needs.classify.outputs.smoke_lanes }}
+      - name: Upload live evidence
+        # JUnit XML, logs and summaries of the make verify-* lanes the smoke
+        # action ran; evidence only, so an upload failure never fails the lane.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: live-evidence-pr-cubrid-11.4
+          path: .live-evidence/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
 
   smoke-112:
     name: Smoke Tests (CUBRID 11.2)
@@ -545,6 +562,20 @@ jobs:
         with:
           cubrid-version: "11.2"
           verify-paths: ${{ needs.classify.outputs.verify_paths }}
+          live-lanes: ${{ needs.classify.outputs.smoke_lanes }}
+      - name: Upload live evidence
+        # JUnit XML, logs and summaries of the make verify-* lanes the smoke
+        # action ran; evidence only, so an upload failure never fails the lane.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: live-evidence-pr-cubrid-11.2
+          path: .live-evidence/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
 
   # Advisory only (#239), never part of ci-gate: the weekly schedule also runs
   # representative goldens against pycubrid and sqlalchemy-cubrid `main`

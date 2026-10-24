@@ -84,6 +84,59 @@ class RewriteTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(text, source)
 
+    # --- #362: reference definitions, the footnote guard, and fence edges ---
+
+    def test_reference_definition_to_a_staged_source_is_rewritten(self) -> None:
+        text, errors = self.rewrite("[guide]: SUPPORT_MATRIX.md#top\nread [guide][] now\n")
+        self.assertEqual(errors, [])
+        self.assertEqual(text, "[guide]: support-matrix.md#top\nread [guide][] now\n")
+
+    def test_broken_reference_definition_is_reported_once_and_left_intact(self) -> None:
+        source = "[gone]: templates/error-handling/README.md\n"
+        text, errors = self.rewrite(source)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("points to missing 'templates/error-handling/README.md'", errors[0])
+        self.assertEqual(text, source)
+
+    def test_footnote_definition_is_neither_rewritten_nor_reported(self) -> None:
+        # REF_DEF_RE excludes `[^x]:`, so a footnote label is never mistaken for a
+        # link reference definition: neither target is resolved against the repo.
+        source = "[^1]: templates/error-handling/README.md\n[^2]: SUPPORT_MATRIX.md\n"
+        text, errors = self.rewrite(source)
+        self.assertEqual(errors, [])
+        self.assertEqual(text, source)
+
+    def test_double_backtick_span_hiding_a_broken_link_is_preserved(self) -> None:
+        # CODE_SPAN_RE opens on the whole run of backticks, so an inner link in a
+        # double-backtick span is masked rather than rewritten or reported.
+        source = "Run ``[gone](templates/error-handling/README.md)`` first.\n"
+        text, errors = self.rewrite(source)
+        self.assertEqual(errors, [])
+        self.assertEqual(text, source)
+
+    def test_tilde_fence_closes_only_on_its_own_marker(self) -> None:
+        # A backtick line inside a tilde fence stays hidden, and the next real
+        # `~~~` ends the block — proven by the link after it being rewritten.
+        source = (
+            "~~~markdown\n"
+            "[gone](templates/error-handling/README.md)\n"
+            "```\n"
+            "[also-gone](templates/error-handling/README.md)\n"
+            "~~~\n"
+            "[m](SUPPORT_MATRIX.md)\n"
+        )
+        text, errors = self.rewrite(source)
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            text,
+            "~~~markdown\n"
+            "[gone](templates/error-handling/README.md)\n"
+            "```\n"
+            "[also-gone](templates/error-handling/README.md)\n"
+            "~~~\n"
+            "[m](support-matrix.md)\n",
+        )
+
     def test_missing_target_is_reported(self) -> None:
         _, errors = self.rewrite("[gone](templates/error-handling/)\n")
         self.assertEqual(len(errors), 1)
